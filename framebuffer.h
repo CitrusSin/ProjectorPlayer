@@ -8,11 +8,11 @@
 /* Execution environment struct of this library. */
 struct fb_env {
     int fd_fb;
+    bool buffered;
     void *fb_base, *fb_swap;
     int swap_state;
     size_t fb_size;
     struct fb_var_screeninfo fb_inf;
-    const struct fb_fix_screeninfo fb_fix;
 };
 
 /* Handler is a pointer of an execution environment */
@@ -50,12 +50,13 @@ unsigned int fb_color(fb_handler hd, unsigned int color);
 /*
  * Set whether double-buffering enabled.
  * Arguments:
- *     fb_handler hd: Created by calling fb_init(); Handler of the framebuffer library execution context
- *     bool enable:   true to enable double-buffering, false otherwise
+ *     fb_handler hd:               Created by calling fb_init(); Handler of the framebuffer library execution context
+ *     bool enable:                 true to enable double-buffering, false otherwise
+ *     int new_xres, int new_yres:  new resolution
  * Returns:
  *     int err: 0 if nothing wrong. -1 otherwise.
  */
-int fb_set_doublebuffer(fb_handler hd, bool enable);
+int fb_set_doublebuffer(fb_handler hd, bool enable, int new_xres, int new_yres);
 
 /*
  * Flush buffer. Only effective and well-formed when double-buffering enabled.

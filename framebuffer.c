@@ -12,6 +12,25 @@
 #include "framebuffer.h"
 
 
+static inline int fbs_map(fb_handler hd) {
+    hd->fb_size = (size_t)hd->fb_inf.xres * hd->fb_inf.yres * hd->fb_inf.bits_per_pixel / 8;
+
+    hd->fb_base = mmap(NULL, hd->fb_size * (hd->buffered ? 2 : 1), PROT_READ | PROT_WRITE, MAP_SHARED, hd->fd_fb, 0);
+    if (hd->fb_base == MAP_FAILED) {
+        hd->fb_base = NULL;
+        return -1;
+    }
+    if (hd->buffered) {
+        hd->fb_swap = ((unsigned char *)hd->fb_base) + hd->fb_size;
+    }
+    return 0;
+}
+
+static inline void fbs_unmap(fb_handler hd) {
+    munmap(hd->fb_base, hd->fb_size);
+    hd->fb_base = hd->fb_swap = NULL;
+}
+
 /*
  * Opens a framebuffer device and creates an execution context on it.
  * Arguments:
@@ -22,14 +41,13 @@
  */
 fb_handler fb_init(const char* dev_name) {
     fb_handler hd = (fb_handler)malloc(sizeof(struct fb_env));
+    if (hd == NULL) {
+        return NULL;
+    }
 
     hd->fd_fb = open(dev_name, O_RDWR);
 
     if (ioctl(hd->fd_fb, FBIOGET_VSCREENINFO, &hd->fb_inf)) {
-        goto error_cleanup;
-    }
-
-    if (ioctl(hd->fd_fb, FBIOGET_FSCREENINFO, &hd->fb_fix)) {
         goto error_cleanup;
     }
 
@@ -57,10 +75,10 @@ fb_handler fb_init(const char* dev_name) {
         goto error_cleanup;
     }
 
+    hd->buffered = false;
     hd->swap_state = 0;
-    hd->fb_swap = NULL;
-    hd->fb_base = mmap(NULL, hd->fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, hd->fd_fb, 0);
-    if (hd->fb_base == MAP_FAILED) {
+    hd->fb_base = hd->fb_swap = NULL;
+    if (fbs_map(hd) != 0) {
         goto error_cleanup;
     }
     return hd;
@@ -80,15 +98,12 @@ error_cleanup:
  *     int err: 0 if nothing wrong. -1 otherwise.
  */
 int fb_release(fb_handler hd) {
-    bool success = true;
-
-    success &= munmap(hd->fb_base, hd->fb_size) == 0;
-    if (hd->fb_swap != NULL) success &= munmap(hd->fb_swap, hd->fb_size) == 0;
+    fbs_unmap(hd);
 
     close(hd->fd_fb);
     free(hd);
 
-    return success ? 0 : -1;
+    return 0;
 }
 
 
@@ -123,40 +138,52 @@ unsigned int fb_color(fb_handler hd, unsigned int color) {
  * Returns:
  *     int err: 0 if nothing wrong. -1 otherwise.
  */
-int fb_set_doublebuffer(fb_handler hd, bool enable) {
-    struct fb_var_screeninfo old_inf = hd->fb_inf;
+int fb_set_doublebuffer(fb_handler hd, bool enable, int new_xres, int new_yres) {
+    if (new_xres <= 0) new_xres = hd->fb_inf.xres;
+    if (new_yres <= 0) new_yres = hd->fb_inf.yres;
 
-    if (enable) {
-        hd->fb_inf.yres_virtual = hd->fb_inf.yres * 2;
-        hd->fb_inf.yoffset      = hd->fb_inf.yres;
-        if (ioctl(hd->fd_fb, FBIOPUT_VSCREENINFO, &hd->fb_inf)) {
-            goto error_cleanup;
-        }
-        hd->fb_swap = mmap(NULL, hd->fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, hd->fd_fb, hd->fb_size);
-        if (hd->fb_swap == MAP_FAILED) {
-            goto error_cleanup_1;
-        }
-    } else {
-        if (hd->fb_swap != NULL && munmap(hd->fb_swap, hd->fb_size) != 0) {
-            goto error;
-        }
-        hd->fb_swap = NULL;
-        hd->fb_inf.yres_virtual = hd->fb_inf.yres;
-        hd->fb_inf.yoffset      = 0;
-        hd->swap_state          = 0;
-        if (ioctl(hd->fd_fb, FBIOPUT_VSCREENINFO, &hd->fb_inf)) {
-            goto error_cleanup;
-        }
+    size_t new_px = (size_t) new_xres * new_yres * hd->fb_inf.bits_per_pixel * (enable ? 2 : 1) / 8;
+
+    struct fb_fix_screeninfo fb_fix;
+    if (ioctl(hd->fd_fb, FBIOGET_FSCREENINFO, &fb_fix)) {
+        return -1;
     }
+    if (fb_fix.smem_len < new_px) {
+        return -1;
+    }
+
+    struct fb_var_screeninfo fb_old_inf = hd->fb_inf;
+
+    fbs_unmap(hd);
+
+    hd->buffered            = enable;
+    hd->swap_state          = 0;
+    hd->fb_inf.xres         = hd->fb_inf.xres_virtual = new_xres;
+    hd->fb_inf.yres         = new_yres;
+    hd->fb_inf.yres_virtual = new_yres * (enable ? 2 : 1);
+    hd->fb_inf.yoffset      = enable ? hd->fb_inf.yres : 0;
+
+    if (ioctl(hd->fd_fb, FBIOPUT_VSCREENINFO, &hd->fb_inf)) {
+        goto error_cleanup;
+    }
+
+    hd->fb_size = (size_t)hd->fb_inf.xres * hd->fb_inf.yres * hd->fb_inf.bits_per_pixel / 8;
+
+    if (enable && hd->fb_inf.yres_virtual < 2 * hd->fb_inf.yres) {
+        hd->buffered = false;
+        goto error_cleanup;
+    }
+
+    if (fbs_map(hd) != 0) {
+        goto error_cleanup;
+    }
+
     return 0;
 
-error_cleanup_1:
-    hd->fb_swap = NULL;
 error_cleanup:
-    // Configure to old screeninfo
-    hd->fb_inf = old_inf;
-    ioctl(hd->fd_fb, FBIOPUT_VSCREENINFO, &hd->fb_inf);
-error:
+    hd->fb_inf = fb_old_inf;
+    hd->fb_size = (size_t)hd->fb_inf.xres * hd->fb_inf.yres * hd->fb_inf.bits_per_pixel / 8;
+    fbs_map(hd);
     return -1;
 }
 
@@ -169,7 +196,7 @@ error:
  *     int err: 0 if nothing wrong. -1 otherwise.
  */
 int fb_flush(fb_handler hd) {
-    if (hd->fb_swap == NULL) {
+    if (!hd->buffered) {
         // Swap not enabled
         return -1;
     }
